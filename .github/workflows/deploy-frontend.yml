@@ -1,0 +1,269 @@
+name: Reusable Deploy Workflow - Frontend (Generic)
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: 'Target repository name to deploy'
+      infra_repo:
+        required: true
+        type: string
+        description: 'Infrastructure repository name'
+      backend_api_url:
+        required: false
+        type: string
+        description: 'Backend API URL for frontend to connect to (single backend)'
+      tier:
+        required: false
+        type: string
+        default: 'free'
+        description: 'Deployment tier: free, standard, premium (auto-detected from Azure subscription)'
+
+env:
+  NODE_VERSION: '20.x'
+
+jobs:
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      build_command: ${{ steps.detect.outputs.build_command }}
+      output_path: ${{ steps.detect.outputs.output_path }}
+      api_url: ${{ steps.compute_api_url.outputs.url }}
+      app_name: ${{ steps.setup.outputs.app_name }}
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Detect Frontend Framework
+        id: detect
+        run: |
+          echo "project_type=frontend" >> $GITHUB_OUTPUT
+
+          if [ -f "package.json" ]; then
+            if grep -q '"next"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=out" >> $GITHUB_OUTPUT
+              echo "Detected: Next.js"
+            elif grep -q '"vite"\|"@vitejs"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Vite"
+            elif grep -q '"react-scripts"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=build" >> $GITHUB_OUTPUT
+              echo "Detected: Create React App"
+            elif grep -q '"@angular/core"' package.json; then
+              echo "build_command=npm run build -- --configuration production" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Angular"
+            elif grep -q '"vue"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Vue.js"
+            else
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+              echo "Detected: Generic Node.js frontend"
+            fi
+          fi
+
+      - name: Compute API URL
+        id: compute_api_url
+        run: |
+          if [ -n "${{ inputs.backend_api_url }}" ]; then
+            echo "url=${{ inputs.backend_api_url }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup App Name
+        id: setup
+        run: |
+          APP_NAME=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "App name: $APP_NAME"
+
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    env:
+      TFSTATE_RESOURCE_GROUP: ${{ secrets.TFSTATE_RESOURCE_GROUP }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ secrets.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+    outputs:
+      static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+
+    steps:
+      - name: Checkout Infrastructure Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          path: infra
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+          terraform_wrapper: false
+
+      - name: Terraform Init (Remote State)
+        working-directory: ./infra/terraform/frontend
+        run: |
+          set -euo pipefail
+
+          APP_NAME_SAFE=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr ' _.' '---')
+          STATE_KEY="releases/${GITHUB_REF_NAME}/${APP_NAME_SAFE}/frontend.tfstate"
+
+          for required_var in TFSTATE_RESOURCE_GROUP TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER; do
+            if [ -z "${!required_var:-}" ]; then
+              echo "::error::Missing required secret: ${required_var}"
+              exit 1
+            fi
+          done
+
+          terraform init \
+            -input=false \
+            -upgrade=false \
+            -reconfigure \
+            -backend-config="resource_group_name=${TFSTATE_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Validate
+        working-directory: ./infra/terraform/frontend
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ./infra/terraform/frontend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          TF_VARS="-var=app_name=$APP_NAME -var=project_type=frontend -var=tier=${{ inputs.tier }}"
+
+          if [ -n "${{ inputs.backend_api_url }}" ]; then
+            TF_VARS="$TF_VARS -var=backend_api_url=${{ inputs.backend_api_url }}"
+          fi
+
+          terraform plan -input=false -parallelism=1 $TF_VARS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra/terraform/frontend
+        run: terraform apply -input=false -parallelism=1 -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform_output
+        working-directory: ./infra/terraform/frontend
+        run: |
+          echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+          echo "static_webapp_name=$(terraform output -raw static_webapp_name)" >> $GITHUB_OUTPUT
+          echo "deployment_token=$(terraform output -raw static_webapp_api_key)" >> $GITHUB_OUTPUT
+
+          echo "Static Web App: $(terraform output -raw static_webapp_name)"
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm ci 2>/dev/null || npm install
+
+      - name: Build
+        run: ${{ needs.detect-and-setup.outputs.build_command }}
+        env:
+          CI: false
+          VITE_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          REACT_APP_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          NEXT_PUBLIC_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+          VUE_APP_API_URL: ${{ needs.detect-and-setup.outputs.api_url }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-artifact
+          path: ${{ needs.detect-and-setup.outputs.output_path }}
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-frontend]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-artifact
+          path: ./dist
+
+      - name: Deploy to Azure Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ needs.terraform.outputs.deployment_token }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "./dist"
+          skip_app_build: true
+
+      - name: Health Check - Frontend
+        run: |
+          FRONTEND_URL="https://${{ needs.terraform.outputs.static_webapp_name }}.azurestaticapps.net"
+          echo "Running health check on: $FRONTEND_URL"
+          echo ""
+
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES..."
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$FRONTEND_URL" 2>/dev/null || echo "000")
+            echo "HTTP Status: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 500 ]; then
+              echo ""
+              echo "Frontend health check PASSED (HTTP $HTTP_STATUS)"
+              SUCCESS=true
+              break
+            fi
+
+            if [ "$i" -lt "$MAX_RETRIES" ]; then
+              echo "Waiting ${RETRY_DELAY}s before retry..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo ""
+            echo "Frontend health check FAILED after $MAX_RETRIES attempts"
+            echo "WARNING: Frontend may not be accessible at $FRONTEND_URL"
+            exit 1
+          fi

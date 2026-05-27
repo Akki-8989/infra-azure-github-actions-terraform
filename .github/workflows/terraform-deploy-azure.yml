@@ -1,0 +1,156 @@
+name: Terraform Deploy Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: 'Terraform component to deploy'
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+      app_name:
+        description: 'Application name used by Terraform naming'
+        required: true
+        type: string
+      location:
+        description: 'Azure region'
+        required: false
+        default: 'Central India'
+        type: string
+      tier:
+        description: 'Deployment tier'
+        required: false
+        default: 'free'
+        type: choice
+        options:
+          - free
+          - standard
+          - premium
+      backend_api_url:
+        description: 'Backend API URL for frontend (optional)'
+        required: false
+        default: ''
+        type: string
+      runtime_stack:
+        description: 'Backend runtime stack'
+        required: false
+        default: 'dotnet'
+        type: choice
+        options:
+          - dotnet
+          - node
+          - python
+          - java
+      frontend_allowed_origins:
+        description: 'Comma-separated frontend origins for backend CORS'
+        required: false
+        default: ''
+        type: string
+      service_environment:
+        description: 'Backend HealthStatusDto environment value'
+        required: false
+        default: 'prod'
+        type: string
+
+concurrency:
+  group: terraform-${{ inputs.component }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: 'true'
+      TFSTATE_RESOURCE_GROUP: ${{ secrets.TFSTATE_RESOURCE_GROUP }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ secrets.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+          terraform_wrapper: false
+
+      - name: Terraform Init (Remote State)
+        run: |
+          set -euo pipefail
+
+          COMPONENT="${{ inputs.component }}"
+          APP_NAME_SAFE=$(echo "${{ inputs.app_name }}" | tr '[:upper:]' '[:lower:]' | tr ' _.' '---')
+          STATE_KEY="releases/${GITHUB_REF_NAME}/${APP_NAME_SAFE}/${COMPONENT}.tfstate"
+
+          for required_var in TFSTATE_RESOURCE_GROUP TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER; do
+            if [ -z "${!required_var:-}" ]; then
+              echo "::error::Missing required secret: ${required_var}"
+              exit 1
+            fi
+          done
+
+          terraform -chdir=terraform/${COMPONENT} init \
+            -input=false \
+            -upgrade=false \
+            -reconfigure \
+            -backend-config="resource_group_name=${TFSTATE_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Validate
+        run: terraform -chdir=terraform/${{ inputs.component }} validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set -euo pipefail
+
+          COMPONENT="${{ inputs.component }}"
+          APP_NAME="${{ inputs.app_name }}"
+          LOCATION="${{ inputs.location }}"
+          TIER="${{ inputs.tier }}"
+          BACKEND_API_URL="${{ inputs.backend_api_url }}"
+          RUNTIME_STACK="${{ inputs.runtime_stack }}"
+          FRONTEND_ALLOWED_ORIGINS="${{ inputs.frontend_allowed_origins }}"
+          SERVICE_ENVIRONMENT="${{ inputs.service_environment }}"
+
+          TF_VARS="-var=app_name=${APP_NAME} -var=project_type=${COMPONENT} -var=location=${LOCATION} -var=tier=${TIER}"
+
+          if [ "$COMPONENT" = "backend" ]; then
+            TF_VARS="$TF_VARS -var=runtime_stack=${RUNTIME_STACK}"
+            TF_VARS="$TF_VARS -var=service_environment=${SERVICE_ENVIRONMENT}"
+
+            if [ -n "$FRONTEND_ALLOWED_ORIGINS" ]; then
+              TF_VARS="$TF_VARS -var=frontend_allowed_origins=${FRONTEND_ALLOWED_ORIGINS}"
+            fi
+          fi
+
+          if [ "$COMPONENT" = "frontend" ] && [ -n "$BACKEND_API_URL" ]; then
+            TF_VARS="$TF_VARS -var=backend_api_url=${BACKEND_API_URL}"
+          fi
+
+          terraform -chdir=terraform/${COMPONENT} plan -input=false -parallelism=1 ${TF_VARS} -out=tfplan
+
+      - name: Terraform Apply (Planned)
+        run: terraform -chdir=terraform/${{ inputs.component }} apply -input=false -parallelism=1 -auto-approve tfplan

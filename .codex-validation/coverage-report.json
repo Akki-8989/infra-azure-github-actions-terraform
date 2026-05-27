@@ -1,0 +1,5 @@
+{
+  "isCovered": true,
+  "missingRequirements": [],
+  "summary": "Terraform provisions Azure frontend and optional backend with HTTPS endpoints, configures backend health/status environment settings and CORS-origin restriction, excludes SQL/queue assumptions, and GitHub Actions workflows validate and deploy Terraform deterministically without database-required steps or API contract changes."
+}

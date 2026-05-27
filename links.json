@@ -1,0 +1,14 @@
+{
+  "frontendlinks": [
+    {
+      "frontend": "UI-Calculator",
+      "backends": []
+    }
+  ],
+  "backendLinks": [
+    {
+      "backend": "BE-Backend",
+      "backends": []
+    }
+  ]
+}

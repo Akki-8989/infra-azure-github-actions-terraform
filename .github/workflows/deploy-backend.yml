@@ -1,0 +1,517 @@
+name: Reusable Deploy Workflow - Backend (Generic)
+
+on:
+  workflow_call:
+    inputs:
+      repo_name:
+        required: true
+        type: string
+        description: 'Target repository name to deploy'
+      infra_repo:
+        required: true
+        type: string
+        description: 'Infrastructure repository name'
+      backend_api_url:
+        required: false
+        type: string
+        description: 'Backend API URL for frontend to connect to (single backend)'
+      backend_dependency_urls:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated KEY=VALUE pairs for backend dependency URLs (e.g., BE_PLATFORM_URL=https://be-platform-webapp.azurewebsites.net)'
+      frontend_allowed_origins:
+        required: false
+        type: string
+        default: ''
+        description: 'Comma-separated frontend origins allowed for backend CORS'
+      service_environment:
+        required: false
+        type: string
+        default: 'prod'
+        description: 'Environment value returned by health/status endpoints'
+      tier:
+        required: false
+        type: string
+        default: 'free'
+        description: 'Deployment tier: free, standard, premium (auto-detected from Azure subscription)'
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  NODE_VERSION: '20.x'
+  PYTHON_VERSION: '3.11'
+  JAVA_VERSION: '17'
+
+jobs:
+  # ============================================
+  # JOB 1: Detect Technology & Setup
+  # ============================================
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      runtime_stack: ${{ steps.detect.outputs.runtime_stack }}
+      project_path: ${{ steps.detect.outputs.project_path }}
+      app_name: ${{ steps.setup.outputs.app_name }}
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Detect Technology
+        id: detect
+        run: |
+          RUNTIME_STACK="dotnet"
+
+          # Priority: .csproj -> requirements.txt/pyproject.toml -> pom.xml/build.gradle -> package.json
+          if find . -name "*.csproj" -type f | head -1 | grep -q "."; then
+            RUNTIME_STACK="dotnet"
+
+            echo "=== All .csproj files found ==="
+            find . -name "*.csproj" -type f
+            echo ""
+
+            # Strategy 1: Find .csproj with Sdk="Microsoft.NET.Sdk.Web" (web projects)
+            CSPROJ_PATH=""
+            for f in $(find . -name "*.csproj" -type f); do
+              if grep -q 'Microsoft.NET.Sdk.Web' "$f" 2>/dev/null; then
+                CSPROJ_PATH="$f"
+                echo "Found Web SDK project: $f"
+                break
+              fi
+            done
+
+            # Strategy 2: Exclude test projects by name and path
+            if [ -z "$CSPROJ_PATH" ]; then
+              CSPROJ_PATH=$(find . -name "*.csproj" -not -name "*Test*" -not -name "*test*" -not -name "*Tests*" -not -path "*/test*" -not -path "*/Test*" -not -path "*xunit*" -not -path "*nunit*" -type f | head -1)
+              echo "Non-test project found: $CSPROJ_PATH"
+            fi
+
+            # Strategy 3: Fallback to any .csproj
+            if [ -z "$CSPROJ_PATH" ]; then
+              CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
+              echo "Fallback project: $CSPROJ_PATH"
+            fi
+
+            echo "Selected project: $CSPROJ_PATH"
+            echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            RUNTIME_STACK="python"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+            RUNTIME_STACK="java"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            RUNTIME_STACK="node"
+            echo "project_path=." >> $GITHUB_OUTPUT
+          else
+            echo "project_path=." >> $GITHUB_OUTPUT
+          fi
+
+          echo "runtime_stack=$RUNTIME_STACK" >> $GITHUB_OUTPUT
+          echo "Detected runtime stack: $RUNTIME_STACK"
+
+      - name: Setup App Name
+        id: setup
+        run: |
+          APP_NAME=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "App name: $APP_NAME"
+
+  # ============================================
+  # JOB 2: Terraform (Infrastructure)
+  # ============================================
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    env:
+      TFSTATE_RESOURCE_GROUP: ${{ secrets.TFSTATE_RESOURCE_GROUP }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ secrets.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+    outputs:
+      webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+
+    steps:
+      - name: Checkout Infrastructure Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          path: infra
+
+      - name: Debug - List contents
+        run: |
+          echo "=== Infrastructure Repo ==="
+          echo "${{ github.repository_owner }}/${{ inputs.infra_repo }}"
+          echo ""
+          echo "=== List infra/terraform folder ==="
+          ls -la ./infra/terraform/
+          echo ""
+          echo "=== List backend folder ==="
+          ls -la ./infra/terraform/backend/
+          echo ""
+          echo "=== Runtime Stack: ${{ needs.detect-and-setup.outputs.runtime_stack }} ==="
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+          terraform_wrapper: false
+
+      - name: Terraform Init (Remote State)
+        working-directory: ./infra/terraform/backend
+        run: |
+          set -euo pipefail
+
+          APP_NAME_SAFE=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr ' _.' '---')
+          STATE_KEY="releases/${GITHUB_REF_NAME}/${APP_NAME_SAFE}/backend.tfstate"
+
+          for required_var in TFSTATE_RESOURCE_GROUP TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER; do
+            if [ -z "${!required_var:-}" ]; then
+              echo "::error::Missing required secret: ${required_var}"
+              exit 1
+            fi
+          done
+
+          terraform init \
+            -input=false \
+            -upgrade=false \
+            -reconfigure \
+            -backend-config="resource_group_name=${TFSTATE_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=${STATE_KEY}" \
+            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Validate
+        working-directory: ./infra/terraform/backend
+        run: terraform validate
+
+      - name: Import Existing Resources
+        working-directory: ./infra/terraform/backend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          FRONTEND_ALLOWED_ORIGINS="${{ inputs.frontend_allowed_origins }}"
+          SERVICE_ENVIRONMENT="${{ inputs.service_environment }}"
+          RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
+          SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+
+          echo "=========================================="
+          echo "App Name: $APP_NAME"
+          echo "Runtime Stack: $RUNTIME_STACK"
+          echo "Frontend Allowed Origins: $FRONTEND_ALLOWED_ORIGINS"
+          echo "Service Environment: $SERVICE_ENVIRONMENT"
+          echo "Resource Prefix: $RESOURCE_PREFIX"
+          echo "=========================================="
+
+          # Build terraform import vars (dynamic - no hardcoded values)
+          build_import_vars() {
+            local VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK"
+            VARS="$VARS -var=service_environment=$SERVICE_ENVIRONMENT"
+            if [ -n "$FRONTEND_ALLOWED_ORIGINS" ]; then
+              VARS="$VARS -var=frontend_allowed_origins=$FRONTEND_ALLOWED_ORIGINS"
+            fi
+            echo "$VARS"
+          }
+
+          resource_exists_in_azure() {
+            local CHECK_COMMAND=$1
+            if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          resource_in_state() {
+            local RESOURCE_ADDRESS=$1
+            if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          import_resource() {
+            local RESOURCE_TYPE=$1
+            local RESOURCE_ADDRESS=$2
+            local RESOURCE_ID=$3
+            local IMPORT_VARS=$(build_import_vars)
+
+            echo ""
+            echo "--- Importing $RESOURCE_TYPE ---"
+            terraform import $IMPORT_VARS "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED"
+          }
+
+          # ---- 1. Resource Group ----
+          echo ""
+          echo "=== Checking Resource Group ==="
+          if resource_in_state "azurerm_resource_group.main"; then
+            echo "Resource Group: Already in state - SKIP"
+          elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
+            echo "Resource Group: EXISTS in Azure"
+            import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+          else
+            echo "Resource Group: Does NOT exist - will be created"
+          fi
+
+          # ---- 2. App Service Plan ----
+          echo ""
+          echo "=== Checking App Service Plan ==="
+          if resource_in_state "azurerm_service_plan.main\[0\]"; then
+            echo "App Service Plan: Already in state - SKIP"
+          elif resource_exists_in_azure "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"; then
+            echo "App Service Plan: EXISTS in Azure"
+            import_resource "App Service Plan" "azurerm_service_plan.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan"
+          else
+            echo "App Service Plan: Does NOT exist - will be created"
+          fi
+
+          # ---- 3. Web App (Windows for .NET, Linux for others) ----
+          echo ""
+          echo "=== Checking Web App (Runtime: $RUNTIME_STACK) ==="
+          if [ "$RUNTIME_STACK" = "dotnet" ]; then
+            # Windows Web App for .NET
+            if resource_in_state "azurerm_windows_web_app.main\[0\]"; then
+              echo "Windows Web App: Already in state - SKIP"
+            elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+              echo "Windows Web App: EXISTS in Azure"
+              import_resource "Windows Web App" "azurerm_windows_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+            else
+              echo "Windows Web App: Does NOT exist - will be created"
+            fi
+          else
+            # Linux Web App for Node.js, Python, Java
+            if resource_in_state "azurerm_linux_web_app.main\[0\]"; then
+              echo "Linux Web App: Already in state - SKIP"
+            elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+              echo "Linux Web App: EXISTS in Azure"
+              import_resource "Linux Web App" "azurerm_linux_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+            else
+              echo "Linux Web App: Does NOT exist - will be created"
+            fi
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Import process completed"
+          echo "=========================================="
+
+      - name: Terraform Plan
+        working-directory: ./infra/terraform/backend
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          FRONTEND_ALLOWED_ORIGINS="${{ inputs.frontend_allowed_origins }}"
+          SERVICE_ENVIRONMENT="${{ inputs.service_environment }}"
+
+          TF_VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK -var=service_environment=$SERVICE_ENVIRONMENT -var=tier=${{ inputs.tier }}"
+
+          if [ -n "$FRONTEND_ALLOWED_ORIGINS" ]; then
+            TF_VARS="$TF_VARS -var=frontend_allowed_origins=$FRONTEND_ALLOWED_ORIGINS"
+          fi
+
+          terraform plan -input=false -parallelism=1 $TF_VARS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./infra/terraform/backend
+        run: terraform apply -input=false -parallelism=1 -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform_output
+        working-directory: ./infra/terraform/backend
+        run: |
+          echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+          echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
+
+          echo "Web App: $(terraform output -raw webapp_name)"
+
+  # ============================================
+  # JOB 3: Build Backend (Multi-Technology)
+  # ============================================
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      # === .NET Build ===
+      - name: Fix global.json SDK version
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        run: |
+          if [ -f "global.json" ]; then
+            echo '{"sdk":{"version":"8.0.100","rollForward":"latestMajor"}}' > global.json
+            echo "Fixed global.json to allow SDK roll-forward"
+          fi
+
+      - name: Setup .NET
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: .NET Publish
+        if: needs.detect-and-setup.outputs.runtime_stack == 'dotnet'
+        run: dotnet publish ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --output ./publish
+
+      # === Node.js Build ===
+      - name: Setup Node.js
+        if: needs.detect-and-setup.outputs.runtime_stack == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Node.js Install and Build
+        if: needs.detect-and-setup.outputs.runtime_stack == 'node'
+        run: |
+          npm install
+          npm run build --if-present
+          mkdir -p ./publish
+          # Copy all files except .git and node_modules cache
+          rsync -a --exclude='.git' --exclude='node_modules/.cache' --exclude='publish' . ./publish/
+
+      # === Python Build ===
+      - name: Setup Python
+        if: needs.detect-and-setup.outputs.runtime_stack == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Python Install Dependencies
+        if: needs.detect-and-setup.outputs.runtime_stack == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+          mkdir -p ./publish
+          rsync -a --exclude='.git' --exclude='publish' . ./publish/
+
+      # === Java Build ===
+      - name: Setup Java
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Java Build (Maven)
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java' && hashFiles('pom.xml') != ''
+        run: |
+          mvn clean package -DskipTests
+          mkdir -p ./publish
+          cp target/*.jar ./publish/ 2>/dev/null || cp target/*.war ./publish/ 2>/dev/null || true
+
+      - name: Java Build (Gradle)
+        if: needs.detect-and-setup.outputs.runtime_stack == 'java' && hashFiles('build.gradle') != ''
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          ./gradlew build -x test
+          mkdir -p ./publish
+          cp build/libs/*.jar ./publish/ 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-artifact
+          path: ./publish
+
+  # ============================================
+  # JOB 4: Deploy Backend to Azure Web App
+  # ============================================
+  deploy-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-backend]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-artifact
+          path: ./publish
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ needs.terraform.outputs.webapp_name }}
+          package: ./publish
+
+      - name: Set Backend Dependency App Settings
+        if: inputs.backend_dependency_urls != ''
+        run: |
+          echo "Setting backend dependency URLs as App Settings..."
+          echo "Input: ${{ inputs.backend_dependency_urls }}"
+
+          IFS=',' read -ra PAIRS <<< "${{ inputs.backend_dependency_urls }}"
+          SETTINGS=""
+          for pair in "${PAIRS[@]}"; do
+            SETTINGS="$SETTINGS $pair"
+          done
+
+          az webapp config appsettings set \
+            --name ${{ needs.terraform.outputs.webapp_name }} \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --settings $SETTINGS
+
+          echo "Backend dependency app settings configured successfully"
+          echo "Settings applied: $SETTINGS"
+
+      - name: Health Check
+        run: |
+          WEBAPP_URL="https://${{ needs.terraform.outputs.webapp_name }}.azurewebsites.net"
+          echo "Running health check on: $WEBAPP_URL"
+          echo ""
+
+          MAX_RETRIES=5
+          RETRY_DELAY=15
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES..."
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$WEBAPP_URL" 2>/dev/null || echo "000")
+            echo "HTTP Status: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 500 ]; then
+              echo ""
+              echo "Health check PASSED (HTTP $HTTP_STATUS)"
+              SUCCESS=true
+              break
+            fi
+
+            if [ "$i" -lt "$MAX_RETRIES" ]; then
+              echo "Waiting ${RETRY_DELAY}s before retry..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo ""
+            echo "Health check FAILED after $MAX_RETRIES attempts"
+            echo "WARNING: App may not be running correctly at $WEBAPP_URL"
+            exit 1
+          fi
