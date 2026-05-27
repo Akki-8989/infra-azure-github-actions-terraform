@@ -15,26 +15,30 @@ on:
         required: false
         type: string
         description: 'Backend API URL for frontend to connect to (single backend)'
+      backend_urls:
+        required: false
+        type: string
+        description: 'Comma-separated backend URLs (multiple backends - triggers gateway)'
+      database_type:
+        required: false
+        type: string
+        default: 'none'
+        description: 'Database type: none, sqlserver, postgresql, mysql'
+      database_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Database name (optional - auto-generated if empty)'
       backend_dependency_urls:
         required: false
         type: string
         default: ''
         description: 'Comma-separated KEY=VALUE pairs for backend dependency URLs (e.g., BE_PLATFORM_URL=https://be-platform-webapp.azurewebsites.net)'
-      frontend_allowed_origins:
-        required: false
-        type: string
-        default: ''
-        description: 'Comma-separated frontend origins allowed for backend CORS'
-      service_environment:
-        required: false
-        type: string
-        default: 'prod'
-        description: 'Environment value returned by health/status endpoints'
       tier:
         required: false
         type: string
         default: 'free'
-        description: 'Deployment tier: free, standard, premium (auto-detected from Azure subscription)'
+        description: 'Deployment tier: free, standard, premium'
 
 env:
   DOTNET_VERSION: '8.0.x'
@@ -65,34 +69,10 @@ jobs:
           # Priority: .csproj -> requirements.txt/pyproject.toml -> pom.xml/build.gradle -> package.json
           if find . -name "*.csproj" -type f | head -1 | grep -q "."; then
             RUNTIME_STACK="dotnet"
-
-            echo "=== All .csproj files found ==="
-            find . -name "*.csproj" -type f
-            echo ""
-
-            # Strategy 1: Find .csproj with Sdk="Microsoft.NET.Sdk.Web" (web projects)
-            CSPROJ_PATH=""
-            for f in $(find . -name "*.csproj" -type f); do
-              if grep -q 'Microsoft.NET.Sdk.Web' "$f" 2>/dev/null; then
-                CSPROJ_PATH="$f"
-                echo "Found Web SDK project: $f"
-                break
-              fi
-            done
-
-            # Strategy 2: Exclude test projects by name and path
-            if [ -z "$CSPROJ_PATH" ]; then
-              CSPROJ_PATH=$(find . -name "*.csproj" -not -name "*Test*" -not -name "*test*" -not -name "*Tests*" -not -path "*/test*" -not -path "*/Test*" -not -path "*xunit*" -not -path "*nunit*" -type f | head -1)
-              echo "Non-test project found: $CSPROJ_PATH"
-            fi
-
-            # Strategy 3: Fallback to any .csproj
+            CSPROJ_PATH=$(find . -name "*.csproj" -not -path "*/test*" -not -path "*/Test*" -type f | head -1)
             if [ -z "$CSPROJ_PATH" ]; then
               CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
-              echo "Fallback project: $CSPROJ_PATH"
             fi
-
-            echo "Selected project: $CSPROJ_PATH"
             echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
           elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
             RUNTIME_STACK="python"
@@ -123,13 +103,11 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     needs: detect-and-setup
-    env:
-      TFSTATE_RESOURCE_GROUP: ${{ secrets.TFSTATE_RESOURCE_GROUP }}
-      TFSTATE_STORAGE_ACCOUNT: ${{ secrets.TFSTATE_STORAGE_ACCOUNT }}
-      TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
     outputs:
       webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
       resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      db_server_fqdn: ${{ steps.terraform_output.outputs.db_server_fqdn }}
+      db_name: ${{ steps.terraform_output.outputs.db_name }}
 
     steps:
       - name: Checkout Infrastructure Repository
@@ -150,6 +128,8 @@ jobs:
           ls -la ./infra/terraform/backend/
           echo ""
           echo "=== Runtime Stack: ${{ needs.detect-and-setup.outputs.runtime_stack }} ==="
+          echo "=== Database Type: ${{ inputs.database_type }} ==="
+          echo "=== Database Name: ${{ inputs.database_name }} ==="
 
       - name: Azure Login
         uses: azure/login@v2
@@ -165,65 +145,78 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.8.5
           terraform_wrapper: false
 
-      - name: Terraform Init (Remote State)
-        working-directory: ./infra/terraform/backend
-        run: |
-          set -euo pipefail
-
-          APP_NAME_SAFE=$(echo "${{ inputs.repo_name }}" | tr '[:upper:]' '[:lower:]' | tr ' _.' '---')
-          STATE_KEY="releases/${GITHUB_REF_NAME}/${APP_NAME_SAFE}/backend.tfstate"
-
-          for required_var in TFSTATE_RESOURCE_GROUP TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER; do
-            if [ -z "${!required_var:-}" ]; then
-              echo "::error::Missing required secret: ${required_var}"
-              exit 1
-            fi
-          done
-
-          terraform init \
-            -input=false \
-            -upgrade=false \
-            -reconfigure \
-            -backend-config="resource_group_name=${TFSTATE_RESOURCE_GROUP}" \
-            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
-            -backend-config="container_name=${TFSTATE_CONTAINER}" \
-            -backend-config="key=${STATE_KEY}" \
-            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
-            -backend-config="use_azuread_auth=true"
-
-      - name: Terraform Validate
-        working-directory: ./infra/terraform/backend
-        run: terraform validate
-
-      - name: Import Existing Resources
-        working-directory: ./infra/terraform/backend
+      - name: Handle OS Type Migration (Windows ↔ Linux)
         run: |
           APP_NAME="${{ inputs.repo_name }}"
           RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
-          FRONTEND_ALLOWED_ORIGINS="${{ inputs.frontend_allowed_origins }}"
-          SERVICE_ENVIRONMENT="${{ inputs.service_environment }}"
+          RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          RG_NAME="${RESOURCE_PREFIX}-rg"
+
+          EXISTING_KIND=$(az appservice plan show --name "${RESOURCE_PREFIX}-plan" --resource-group "$RG_NAME" --query "kind" -o tsv 2>/dev/null || echo "")
+          echo "Existing plan kind: '$EXISTING_KIND', Runtime: '$RUNTIME_STACK'"
+
+          NEEDS_LINUX=false
+          if [ "$RUNTIME_STACK" != "dotnet" ]; then
+            NEEDS_LINUX=true
+          fi
+
+          if ( [ "$NEEDS_LINUX" = "true" ] && [[ "$EXISTING_KIND" != *"linux"* ]] && [ -n "$EXISTING_KIND" ] ) || \
+             ( [ "$NEEDS_LINUX" = "false" ] && [[ "$EXISTING_KIND" == *"linux"* ]] ); then
+            echo "OS type mismatch — deleting web app and plan before recreation"
+            az webapp delete --name "${RESOURCE_PREFIX}-webapp" --resource-group "$RG_NAME" 2>/dev/null || true
+            az appservice plan delete --name "${RESOURCE_PREFIX}-plan" --resource-group "$RG_NAME" --yes 2>/dev/null || true
+            echo "Deleted conflicting resources. Terraform will recreate them."
+          else
+            echo "No OS type conflict — skipping cleanup."
+          fi
+
+      - name: Terraform Init
+        working-directory: ./infra/terraform/backend
+        run: terraform init
+
+      - name: Import Existing Resources
+        working-directory: ./infra/terraform/backend
+        env:
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+        run: |
+          APP_NAME="${{ inputs.repo_name }}"
+          RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
+          DATABASE_TYPE="${{ inputs.database_type }}"
+          DATABASE_NAME="${{ inputs.database_name }}"
           RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
           SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
           RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+          HAS_SQL_PASSWORD="false"
+
+          if [ -n "$SQL_ADMIN_PASSWORD" ]; then
+            HAS_SQL_PASSWORD="true"
+          fi
 
           echo "=========================================="
           echo "App Name: $APP_NAME"
           echo "Runtime Stack: $RUNTIME_STACK"
-          echo "Frontend Allowed Origins: $FRONTEND_ALLOWED_ORIGINS"
-          echo "Service Environment: $SERVICE_ENVIRONMENT"
+          echo "Database Type: $DATABASE_TYPE"
+          echo "Database Name: $DATABASE_NAME"
           echo "Resource Prefix: $RESOURCE_PREFIX"
+          echo "Has SQL Password: $HAS_SQL_PASSWORD"
           echo "=========================================="
 
           # Build terraform import vars (dynamic - no hardcoded values)
+          TIER="${{ inputs.tier }}"
+          [ -z "$TIER" ] && TIER="free"
+
           build_import_vars() {
-            local VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK"
-            VARS="$VARS -var=service_environment=$SERVICE_ENVIRONMENT"
-            if [ -n "$FRONTEND_ALLOWED_ORIGINS" ]; then
-              VARS="$VARS -var=frontend_allowed_origins=$FRONTEND_ALLOWED_ORIGINS"
+            local VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK -var=tier=$TIER"
+            if [ "$DATABASE_TYPE" != "none" ] && [ -n "$DATABASE_TYPE" ]; then
+              VARS="$VARS -var=database_type=$DATABASE_TYPE"
+            fi
+            if [ -n "$DATABASE_NAME" ]; then
+              VARS="$VARS -var=database_name=$DATABASE_NAME"
+            fi
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              VARS="$VARS -var=sql_admin_password=$SQL_ADMIN_PASSWORD"
             fi
             echo "$VARS"
           }
@@ -306,6 +299,117 @@ jobs:
             fi
           fi
 
+          # ---- 4. SQL Server Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "sqlserver" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking SQL Server ==="
+            if resource_in_state "azurerm_mssql_server.main\[0\]"; then
+              echo "SQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Server: EXISTS in Azure"
+              import_resource "SQL Server" "azurerm_mssql_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver"
+            else
+              echo "SQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking SQL Database ==="
+            if resource_in_state "azurerm_mssql_database.main\[0\]"; then
+              echo "SQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql db show --name $EFFECTIVE_DB_NAME --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Database: EXISTS in Azure"
+              import_resource "SQL Database" "azurerm_mssql_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "SQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking SQL Firewall Rule ==="
+            if resource_in_state "azurerm_mssql_firewall_rule.allow_azure\[0\]"; then
+              echo "SQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+              echo "SQL Firewall Rule: EXISTS in Azure"
+              import_resource "SQL Firewall Rule" "azurerm_mssql_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices"
+            else
+              echo "SQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
+          # ---- 5. PostgreSQL Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "postgresql" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking PostgreSQL Server ==="
+            if resource_in_state "azurerm_postgresql_flexible_server.main\[0\]"; then
+              echo "PostgreSQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server show --name ${RESOURCE_PREFIX}-pgserver --resource-group $RG_NAME"; then
+              echo "PostgreSQL Server: EXISTS in Azure"
+              import_resource "PostgreSQL Server" "azurerm_postgresql_flexible_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver"
+            else
+              echo "PostgreSQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking PostgreSQL Database ==="
+            if resource_in_state "azurerm_postgresql_flexible_server_database.main\[0\]"; then
+              echo "PostgreSQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server db show --database-name $EFFECTIVE_DB_NAME --server-name ${RESOURCE_PREFIX}-pgserver --resource-group $RG_NAME"; then
+              echo "PostgreSQL Database: EXISTS in Azure"
+              import_resource "PostgreSQL Database" "azurerm_postgresql_flexible_server_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "PostgreSQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking PostgreSQL Firewall Rule ==="
+            if resource_in_state "azurerm_postgresql_flexible_server_firewall_rule.allow_azure\[0\]"; then
+              echo "PostgreSQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az postgres flexible-server firewall-rule show --name AllowAzureServices --resource-group $RG_NAME --server-name ${RESOURCE_PREFIX}-pgserver"; then
+              echo "PostgreSQL Firewall Rule: EXISTS in Azure"
+              import_resource "PostgreSQL Firewall Rule" "azurerm_postgresql_flexible_server_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforPostgreSQL/flexibleServers/${RESOURCE_PREFIX}-pgserver/firewallRules/AllowAzureServices"
+            else
+              echo "PostgreSQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
+          # ---- 6. MySQL Resources (conditional) ----
+          if [ "$DATABASE_TYPE" = "mysql" ] && [ "$HAS_SQL_PASSWORD" = "true" ]; then
+            echo ""
+            echo "=== Checking MySQL Server ==="
+            if resource_in_state "azurerm_mysql_flexible_server.main\[0\]"; then
+              echo "MySQL Server: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server show --name ${RESOURCE_PREFIX}-mysqlserver --resource-group $RG_NAME"; then
+              echo "MySQL Server: EXISTS in Azure"
+              import_resource "MySQL Server" "azurerm_mysql_flexible_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver"
+            else
+              echo "MySQL Server: Does NOT exist"
+            fi
+
+            EFFECTIVE_DB_NAME="${DATABASE_NAME:-${RESOURCE_PREFIX}-db}"
+            echo ""
+            echo "=== Checking MySQL Database ==="
+            if resource_in_state "azurerm_mysql_flexible_server_database.main\[0\]"; then
+              echo "MySQL Database: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server db show --database-name $EFFECTIVE_DB_NAME --server-name ${RESOURCE_PREFIX}-mysqlserver --resource-group $RG_NAME"; then
+              echo "MySQL Database: EXISTS in Azure"
+              import_resource "MySQL Database" "azurerm_mysql_flexible_server_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver/databases/$EFFECTIVE_DB_NAME"
+            else
+              echo "MySQL Database: Does NOT exist"
+            fi
+
+            echo ""
+            echo "=== Checking MySQL Firewall Rule ==="
+            if resource_in_state "azurerm_mysql_flexible_server_firewall_rule.allow_azure\[0\]"; then
+              echo "MySQL Firewall Rule: Already in state - SKIP"
+            elif resource_exists_in_azure "az mysql flexible-server firewall-rule show --name AllowAzureServices --resource-group $RG_NAME --server-name ${RESOURCE_PREFIX}-mysqlserver"; then
+              echo "MySQL Firewall Rule: EXISTS in Azure"
+              import_resource "MySQL Firewall Rule" "azurerm_mysql_flexible_server_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.DBforMySQL/flexibleServers/${RESOURCE_PREFIX}-mysqlserver/firewallRules/AllowAzureServices"
+            else
+              echo "MySQL Firewall Rule: Does NOT exist"
+            fi
+          fi
+
           echo ""
           echo "=========================================="
           echo "Import process completed"
@@ -316,20 +420,28 @@ jobs:
         run: |
           APP_NAME="${{ inputs.repo_name }}"
           RUNTIME_STACK="${{ needs.detect-and-setup.outputs.runtime_stack }}"
-          FRONTEND_ALLOWED_ORIGINS="${{ inputs.frontend_allowed_origins }}"
-          SERVICE_ENVIRONMENT="${{ inputs.service_environment }}"
+          DATABASE_TYPE="${{ inputs.database_type }}"
+          DATABASE_NAME="${{ inputs.database_name }}"
 
-          TF_VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK -var=service_environment=$SERVICE_ENVIRONMENT -var=tier=${{ inputs.tier }}"
+          TIER="${{ inputs.tier }}"
+          [ -z "$TIER" ] && TIER="free"
+          TF_VARS="-var=app_name=$APP_NAME -var=project_type=backend -var=runtime_stack=$RUNTIME_STACK -var=tier=$TIER"
 
-          if [ -n "$FRONTEND_ALLOWED_ORIGINS" ]; then
-            TF_VARS="$TF_VARS -var=frontend_allowed_origins=$FRONTEND_ALLOWED_ORIGINS"
+          if [ "$DATABASE_TYPE" != "none" ] && [ -n "$DATABASE_TYPE" ]; then
+            TF_VARS="$TF_VARS -var=database_type=$DATABASE_TYPE"
+          fi
+          if [ -n "$DATABASE_NAME" ]; then
+            TF_VARS="$TF_VARS -var=database_name=$DATABASE_NAME"
+          fi
+          if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ] && [ "$DATABASE_TYPE" != "none" ]; then
+            TF_VARS="$TF_VARS -var=sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}"
           fi
 
-          terraform plan -input=false -parallelism=1 $TF_VARS -out=tfplan
+          terraform plan $TF_VARS -out=tfplan
 
       - name: Terraform Apply
         working-directory: ./infra/terraform/backend
-        run: terraform apply -input=false -parallelism=1 -auto-approve tfplan
+        run: terraform apply -auto-approve tfplan
 
       - name: Get Terraform Outputs
         id: terraform_output
@@ -338,7 +450,15 @@ jobs:
           echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
           echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
 
+          # Database outputs (may be empty if no database)
+          DB_SERVER=$(terraform output -raw db_server_fqdn 2>/dev/null || echo "")
+          DB_NAME=$(terraform output -raw db_name 2>/dev/null || echo "")
+          echo "db_server_fqdn=$DB_SERVER" >> $GITHUB_OUTPUT
+          echo "db_name=$DB_NAME" >> $GITHUB_OUTPUT
+
           echo "Web App: $(terraform output -raw webapp_name)"
+          echo "DB Server: $DB_SERVER"
+          echo "DB Name: $DB_NAME"
 
   # ============================================
   # JOB 3: Build Backend (Multi-Technology)
@@ -431,11 +551,113 @@ jobs:
           path: ./publish
 
   # ============================================
-  # JOB 4: Deploy Backend to Azure Web App
+  # JOB 4: Run Database Scripts (DB-First Approach)
+  # Scripts are in the COMPONENT repo under db-scripts/
+  # Code-First apps don't need this - app creates tables on startup
+  # ============================================
+  run-db-scripts:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform]
+    if: inputs.database_type != 'none' && inputs.database_type != ''
+
+    steps:
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+
+      - name: Run Database Scripts
+        env:
+          DB_SERVER: ${{ needs.terraform.outputs.db_server_fqdn }}
+          DB_NAME: ${{ needs.terraform.outputs.db_name }}
+          DB_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          DB_TYPE: ${{ inputs.database_type }}
+        run: |
+          # DB scripts are in the component repo (DB-First approach)
+          # Code-First apps won't have db-scripts/ folder - this job will skip gracefully
+          if [ ! -d "./db-scripts" ]; then
+            echo "No db-scripts/ directory found in component repo"
+            echo "This is expected for Code-First approach (app creates tables on startup)"
+            exit 0
+          fi
+
+          # Find SQL scripts (sorted for execution order: 001_xxx.sql, 002_yyy.sql, etc.)
+          SCRIPTS=$(find ./db-scripts -name "*.sql" -type f | sort)
+          if [ -z "$SCRIPTS" ]; then
+            echo "No SQL scripts found in db-scripts/ - skipping"
+            exit 0
+          fi
+
+          echo "DB-First Approach: Found SQL scripts to execute:"
+          echo "$SCRIPTS"
+          echo ""
+
+          # Install DB client and run scripts based on database type
+          case "$DB_TYPE" in
+            sqlserver)
+              echo "=== Installing SQL Server tools ==="
+              curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+              curl -fsSL https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+              sudo apt-get update
+              sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+              export PATH="$PATH:/opt/mssql-tools18/bin"
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                sqlcmd -S "$DB_SERVER" -d "$DB_NAME" -U sqladmin -P "$DB_PASSWORD" -i "$script" -C
+                echo "Completed: $script"
+              done
+              ;;
+
+            postgresql)
+              echo "=== Installing PostgreSQL client ==="
+              sudo apt-get update && sudo apt-get install -y postgresql-client
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                PGPASSWORD="$DB_PASSWORD" psql -h "$DB_SERVER" -p 5432 -U pgadmin -d "$DB_NAME" -f "$script"
+                echo "Completed: $script"
+              done
+              ;;
+
+            mysql)
+              echo "=== Installing MySQL client ==="
+              sudo apt-get update && sudo apt-get install -y mysql-client
+
+              for script in $SCRIPTS; do
+                echo ""
+                echo "--- Running: $script ---"
+                mysql -h "$DB_SERVER" -P 3306 -u mysqladmin -p"$DB_PASSWORD" "$DB_NAME" < "$script"
+                echo "Completed: $script"
+              done
+              ;;
+
+            *)
+              echo "Unknown database type: $DB_TYPE - skipping scripts"
+              ;;
+          esac
+
+          echo ""
+          echo "=========================================="
+          echo "All database scripts completed successfully"
+          echo "=========================================="
+
+  # ---- OLD JOB 5: run-code-migrations (REMOVED) ----
+  # Code-First Approach: App creates tables on startup via db.Database.Migrate()
+  # No need to run migrations in pipeline - Terraform creates server + DB,
+  # app handles schema creation when it starts.
+  # ---- END OLD ----
+
+  # ============================================
+  # JOB 5: Deploy Backend to Azure Web App
   # ============================================
   deploy-backend:
     runs-on: ubuntu-latest
-    needs: [detect-and-setup, terraform, build-backend]
+    needs: [detect-and-setup, terraform, build-backend, run-db-scripts]
+    if: |
+      always() &&
+      needs.build-backend.result == 'success' &&
+      (needs.run-db-scripts.result == 'success' || needs.run-db-scripts.result == 'skipped')
 
     steps:
       - name: Download artifact
@@ -480,38 +702,3 @@ jobs:
 
           echo "Backend dependency app settings configured successfully"
           echo "Settings applied: $SETTINGS"
-
-      - name: Health Check
-        run: |
-          WEBAPP_URL="https://${{ needs.terraform.outputs.webapp_name }}.azurewebsites.net"
-          echo "Running health check on: $WEBAPP_URL"
-          echo ""
-
-          MAX_RETRIES=5
-          RETRY_DELAY=15
-          SUCCESS=false
-
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "Attempt $i/$MAX_RETRIES..."
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$WEBAPP_URL" 2>/dev/null || echo "000")
-            echo "HTTP Status: $HTTP_STATUS"
-
-            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 500 ]; then
-              echo ""
-              echo "Health check PASSED (HTTP $HTTP_STATUS)"
-              SUCCESS=true
-              break
-            fi
-
-            if [ "$i" -lt "$MAX_RETRIES" ]; then
-              echo "Waiting ${RETRY_DELAY}s before retry..."
-              sleep $RETRY_DELAY
-            fi
-          done
-
-          if [ "$SUCCESS" = "false" ]; then
-            echo ""
-            echo "Health check FAILED after $MAX_RETRIES attempts"
-            echo "WARNING: App may not be running correctly at $WEBAPP_URL"
-            exit 1
-          fi
