@@ -1,10 +1,8 @@
 terraform {
-  backend "azurerm" {}
-
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "= 3.116.0"
+      version = "~> 3.0"
     }
   }
 }
@@ -24,7 +22,14 @@ variable "app_name" {
 
 variable "location" {
   type    = string
-  default = "Central India"
+  default = "East US"
+}
+
+variable "sql_admin_password" {
+  type        = string
+  description = "Database admin password (optional - used for any database type)"
+  default     = ""
+  sensitive   = true
 }
 
 variable "project_type" {
@@ -39,40 +44,34 @@ variable "backend_api_url" {
   default     = ""
 }
 
+variable "backend_urls" {
+  type        = string
+  description = "Comma-separated backend URLs (multiple backend scenario - triggers gateway creation)"
+  default     = ""
+}
+
 variable "runtime_stack" {
   type        = string
   description = "Runtime stack: dotnet, node, python, java"
   default     = "dotnet"
 }
 
+variable "database_type" {
+  type        = string
+  description = "Database type: none, sqlserver, postgresql, mysql"
+  default     = "none"
+}
+
+variable "database_name" {
+  type        = string
+  description = "Database name to create (optional - auto-generated if empty)"
+  default     = ""
+}
+
 variable "tier" {
   type        = string
   description = "Deployment tier: free, standard, premium"
   default     = "free"
-}
-
-variable "frontend_allowed_origins" {
-  type        = string
-  description = "Comma-separated frontend origins allowed for backend CORS"
-  default     = ""
-}
-
-variable "health_status" {
-  type        = string
-  description = "Operational health status returned by backend health endpoints"
-  default     = "Healthy"
-}
-
-variable "service_name" {
-  type        = string
-  description = "Service name returned by backend health endpoints"
-  default     = "calculator-api"
-}
-
-variable "service_environment" {
-  type        = string
-  description = "Environment name returned by backend health endpoints"
-  default     = "prod"
 }
 
 # ============================================
@@ -89,18 +88,28 @@ locals {
   # Tier-based SKU
   sku_name  = var.tier == "premium" ? "S1" : var.tier == "standard" ? "B1" : "F1"
   always_on = var.tier != "free"
-  frontend_origins = [
-    for origin in split(",", var.frontend_allowed_origins) :
-    trimspace(origin)
-    if trimspace(origin) != ""
-  ]
 
   # Runtime conditions
   is_dotnet  = var.runtime_stack == "dotnet"
   is_linux   = !local.is_dotnet
 
+  # Database conditions
+  create_sql_server  = var.database_type == "sqlserver" && var.sql_admin_password != ""
+  create_postgresql   = var.database_type == "postgresql" && var.sql_admin_password != ""
+  create_mysql        = var.database_type == "mysql" && var.sql_admin_password != ""
+  has_database        = local.create_sql_server || local.create_postgresql || local.create_mysql
+  effective_db_name   = var.database_name != "" ? var.database_name : "${local.resource_prefix}-db"
+
   # Backend flag
   is_backend = var.project_type == "backend"
+
+  # Connection string (computed after DB resources)
+  connection_string = (
+    local.create_sql_server ? "Server=tcp:${azurerm_mssql_server.main[0].fully_qualified_domain_name},1433;Initial Catalog=${local.effective_db_name};User ID=sqladmin;Password=${var.sql_admin_password};Encrypt=true;TrustServerCertificate=false;" :
+    local.create_postgresql ? "Host=${azurerm_postgresql_flexible_server.main[0].fqdn};Port=5432;Database=${local.effective_db_name};Username=pgadmin;Password=${var.sql_admin_password};SSL Mode=Require;" :
+    local.create_mysql ? "Server=${azurerm_mysql_flexible_server.main[0].fqdn};Port=3306;Database=${local.effective_db_name};User=mysqladmin;Password=${var.sql_admin_password};SslMode=Required;" :
+    ""
+  )
 }
 
 # ============================================
@@ -143,27 +152,20 @@ resource "azurerm_windows_web_app" "main" {
     application_stack {
       dotnet_version = "v8.0"
     }
-    dynamic "cors" {
-      for_each = length(local.frontend_origins) > 0 ? [1] : []
-      content {
-        allowed_origins     = local.frontend_origins
-        support_credentials = false
-      }
-    }
   }
 
   app_settings = {
-    "ASPNETCORE_ENVIRONMENT"       = "Production"
-    "HEALTH_STATUS"                = var.health_status
-    "HEALTH_SERVICE"               = var.service_name
-    "HEALTH_ENVIRONMENT"           = var.service_environment
-    "HEALTH_TIMESTAMP_UTC_MODE"    = "runtime"
-    "HealthStatus__Status"         = var.health_status
-    "HealthStatus__Service"        = var.service_name
-    "HealthStatus__Environment"    = var.service_environment
-    "HealthStatus__TimestampUtcMode" = "runtime"
-    "ALLOWED_ORIGINS"              = var.frontend_allowed_origins
-    "Cors__AllowedOrigins"         = var.frontend_allowed_origins
+    "ASPNETCORE_ENVIRONMENT" = "Production"
+  }
+
+  # Auto-inject connection string when database is created
+  dynamic "connection_string" {
+    for_each = local.has_database ? [1] : []
+    content {
+      name  = "DefaultConnection"
+      type  = local.create_sql_server ? "SQLAzure" : "Custom"
+      value = local.connection_string
+    }
   }
 
   depends_on = [
@@ -192,33 +194,144 @@ resource "azurerm_linux_web_app" "main" {
       java_server         = var.runtime_stack == "java" ? "JAVA" : null
       java_server_version = var.runtime_stack == "java" ? "17" : null
     }
-    dynamic "cors" {
-      for_each = length(local.frontend_origins) > 0 ? [1] : []
-      content {
-        allowed_origins     = local.frontend_origins
-        support_credentials = false
-      }
-    }
   }
 
-  app_settings = {
-    "WEBSITES_PORT"               = var.runtime_stack == "node" ? "3000" : var.runtime_stack == "python" ? "8000" : ""
-    "HEALTH_STATUS"               = var.health_status
-    "HEALTH_SERVICE"              = var.service_name
-    "HEALTH_ENVIRONMENT"          = var.service_environment
-    "HEALTH_TIMESTAMP_UTC_MODE"   = "runtime"
-    "HealthStatus__Status"        = var.health_status
-    "HealthStatus__Service"       = var.service_name
-    "HealthStatus__Environment"   = var.service_environment
-    "HealthStatus__TimestampUtcMode" = "runtime"
-    "ALLOWED_ORIGINS"             = var.frontend_allowed_origins
-    "Cors__AllowedOrigins"        = var.frontend_allowed_origins
+  app_settings = merge(
+    { "WEBSITES_PORT" = var.runtime_stack == "node" ? "3000" : var.runtime_stack == "python" ? "8000" : "" },
+    local.has_database ? { "DATABASE_URL" = local.connection_string } : {}
+  )
+
+  # Auto-inject connection string when database is created
+  dynamic "connection_string" {
+    for_each = local.has_database ? [1] : []
+    content {
+      name  = "DefaultConnection"
+      type  = "Custom"
+      value = local.connection_string
+    }
   }
 
   depends_on = [
     azurerm_resource_group.main,
     azurerm_service_plan.main
   ]
+}
+
+# ============================================
+# SQL SERVER (conditional - when database_type = "sqlserver")
+# ============================================
+
+resource "azurerm_mssql_server" "main" {
+  count                        = local.create_sql_server ? 1 : 0
+  name                         = "${local.resource_prefix}-sqlserver"
+  resource_group_name          = azurerm_resource_group.main.name
+  location                     = azurerm_resource_group.main.location
+  version                      = "12.0"
+  administrator_login          = "sqladmin"
+  administrator_login_password = var.sql_admin_password
+
+  depends_on = [azurerm_resource_group.main]
+}
+
+resource "azurerm_mssql_database" "main" {
+  count     = local.create_sql_server ? 1 : 0
+  name      = local.effective_db_name
+  server_id = azurerm_mssql_server.main[0].id
+  sku_name  = "Basic"
+
+  depends_on = [
+    azurerm_resource_group.main,
+    azurerm_mssql_server.main
+  ]
+}
+
+resource "azurerm_mssql_firewall_rule" "allow_azure" {
+  count            = local.create_sql_server ? 1 : 0
+  name             = "AllowAzureServices"
+  server_id        = azurerm_mssql_server.main[0].id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "0.0.0.0"
+
+  depends_on = [azurerm_mssql_server.main]
+}
+
+# ============================================
+# POSTGRESQL FLEXIBLE SERVER (conditional - when database_type = "postgresql")
+# ============================================
+
+resource "azurerm_postgresql_flexible_server" "main" {
+  count                  = local.create_postgresql ? 1 : 0
+  name                   = "${local.resource_prefix}-pgserver"
+  resource_group_name    = azurerm_resource_group.main.name
+  location               = azurerm_resource_group.main.location
+  version                = "15"
+  administrator_login    = "pgadmin"
+  administrator_password = var.sql_admin_password
+  sku_name               = "B_Standard_B1ms"
+  storage_mb             = 32768
+  zone                   = "1"
+
+  depends_on = [azurerm_resource_group.main]
+}
+
+resource "azurerm_postgresql_flexible_server_database" "main" {
+  count     = local.create_postgresql ? 1 : 0
+  name      = local.effective_db_name
+  server_id = azurerm_postgresql_flexible_server.main[0].id
+  charset   = "UTF8"
+  collation = "en_US.utf8"
+
+  depends_on = [azurerm_postgresql_flexible_server.main]
+}
+
+resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_azure" {
+  count            = local.create_postgresql ? 1 : 0
+  name             = "AllowAzureServices"
+  server_id        = azurerm_postgresql_flexible_server.main[0].id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "0.0.0.0"
+
+  depends_on = [azurerm_postgresql_flexible_server.main]
+}
+
+# ============================================
+# MYSQL FLEXIBLE SERVER (conditional - when database_type = "mysql")
+# ============================================
+
+resource "azurerm_mysql_flexible_server" "main" {
+  count                  = local.create_mysql ? 1 : 0
+  name                   = "${local.resource_prefix}-mysqlserver"
+  resource_group_name    = azurerm_resource_group.main.name
+  location               = azurerm_resource_group.main.location
+  administrator_login    = "mysqladmin"
+  administrator_password = var.sql_admin_password
+  sku_name               = "B_Standard_B1ms"
+  version                = "8.0.21"
+  zone                   = "1"
+
+  depends_on = [azurerm_resource_group.main]
+}
+
+resource "azurerm_mysql_flexible_database" "main" {
+  count               = local.create_mysql ? 1 : 0
+  name                = local.effective_db_name
+  resource_group_name = azurerm_resource_group.main.name
+  server_name         = azurerm_mysql_flexible_server.main[0].name
+  charset             = "utf8mb4"
+  collation           = "utf8mb4_unicode_ci"
+
+  depends_on = [azurerm_mysql_flexible_server.main]
+}
+
+resource "azurerm_mysql_flexible_server_firewall_rule" "allow_azure" {
+  count               = local.create_mysql ? 1 : 0
+  name                = "AllowAzureServices"
+  resource_group_name = azurerm_resource_group.main.name
+  server_name         = azurerm_mysql_flexible_server.main[0].name
+  start_ip_address    = "0.0.0.0"
+  end_ip_address      = "0.0.0.0"
+
+  depends_on = [azurerm_mysql_flexible_server.main]
 }
 
 # ============================================
@@ -252,4 +365,24 @@ output "webapp_url" {
       ? (length(azurerm_windows_web_app.main) > 0 ? "https://${azurerm_windows_web_app.main[0].default_hostname}" : "")
       : (length(azurerm_linux_web_app.main) > 0 ? "https://${azurerm_linux_web_app.main[0].default_hostname}" : "")
   ) : ""
+}
+
+# Database outputs
+output "database_type" {
+  value = var.database_type
+}
+
+output "db_server_fqdn" {
+  value = (
+    local.create_sql_server ? azurerm_mssql_server.main[0].fully_qualified_domain_name :
+    local.create_postgresql ? azurerm_postgresql_flexible_server.main[0].fqdn :
+    local.create_mysql ? azurerm_mysql_flexible_server.main[0].fqdn :
+    ""
+  )
+  sensitive = true
+}
+
+output "db_name" {
+  value     = local.has_database ? local.effective_db_name : ""
+  sensitive = true
 }
